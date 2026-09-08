@@ -1,9 +1,8 @@
 import os
-
+from io import BytesIO
 import requests
-
 from m365.auth import Auth
-
+from urllib.parse import quote
 
 class SharePoint:
     """
@@ -210,11 +209,55 @@ class SharePoint:
 
         return destination
 
+    def download_file_bytes(
+        self,
+        drive_id: str,
+        item_id: str,
+    ) -> BytesIO:
+        """
+        Downloads a SharePoint file into memory.
+
+        Parameters
+        ----------
+        drive_id : Drive ID.
+        item_id : File ID.
+
+        Returns
+        -------
+        BytesIO
+            File contents stored in memory.
+        """
+
+        response = self._request(
+            "GET",
+            f"/drives/{drive_id}/items/{item_id}/content",
+        )
+
+        return BytesIO(response.content)
+
     def replace_file(
         self,
-        local_file: str,
+        local_file: str | BytesIO,
         item: dict,
     ):
+        """
+        Replaces the content of a SharePoint file.
+
+        Parameters
+        ----------
+        local_file : str | BytesIO
+            Either:
+            - path to a local file, or
+            - file contents stored in memory.
+
+        item : dict
+            SharePoint DriveItem representing the target file.
+
+        Returns
+        -------
+        dict
+            Updated SharePoint item.
+        """
 
         drive_id = item["parentReference"]["driveId"]
         item_id = item["id"]
@@ -225,16 +268,26 @@ class SharePoint:
             f"/content"
         )
 
-        with open(local_file, "rb") as file:
+        if isinstance(local_file, BytesIO):
 
-            response = self._request(
-                "PUT",
-                endpoint,
-                data=file,
-                headers={
-                    "Content-Type": "application/octet-stream"
-                },
-            )
+            local_file.seek(0)
+
+            data = local_file
+
+        else:
+
+            with open(local_file, "rb") as file:
+
+                data = file.read()
+
+        response = self._request(
+            "PUT",
+            endpoint,
+            data=data,
+            headers={
+                "Content-Type": "application/octet-stream"
+            },
+        )
 
         return response.json()
 
@@ -261,3 +314,56 @@ class SharePoint:
         )
 
         return response.json()["value"]
+
+    # ==========================================================
+    # New functions with specific paths
+    # ==========================================================
+
+    def download_file_by_path(self,drive_id: str,file_path: str,) -> BytesIO:
+        """
+        Downloads a SharePoint file directly into memory
+        using its path inside the document library.
+        """
+
+        encoded_path = quote(
+            file_path.strip("/"),
+            safe="/",
+        )
+
+        response = self._request(
+            "GET",
+            f"/drives/{drive_id}"
+            f"/root:/{encoded_path}:/content",
+        )
+
+        return BytesIO(response.content)
+
+    def upload_file_by_path(
+        self,
+        drive_id: str,
+        file_path: str,
+        file_content: BytesIO,
+    ):
+        """
+        Creates or replaces a small SharePoint file
+        using its destination path.
+        """
+
+        encoded_path = quote(
+            file_path.strip("/"),
+            safe="/",
+        )
+
+        file_content.seek(0)
+
+        response = self._request(
+            "PUT",
+            f"/drives/{drive_id}"
+            f"/root:/{encoded_path}:/content",
+            data=file_content,
+            headers={
+                "Content-Type": "application/octet-stream"
+            },
+        )
+
+        return response.json()
