@@ -4439,30 +4439,29 @@ def auditar_base_demanda(
 
 def agregar_kilometraje_esperado_actual(
     base: pd.DataFrame,
+    fecha_generacion=None,
 ) -> pd.DataFrame:
     """
-    Calcula el nivel preventivo esperado a la fecha de
-    generación.
+    Ajusta el mantenimiento esperado a la fecha actual.
 
-    Conserva dos conceptos:
+    Regla comercial:
 
-    - kilometraje_siguiente_ciclo:
-      siguiente mantenimiento inmediatamente posterior al
-      último observado.
+    1. Para VENCIDO_LEJANO según la fecha política original:
+       - avanzar el mantenimiento preventivo en ciclos
+         sucesivos;
+       - avanzar simultáneamente la fecha política en
+         bloques calendario de 6 meses;
+       - detenerse en el primer ciclo cuya fecha política
+         sea igual o posterior a la fecha de generación.
 
-    - kilometraje_esperado_actual:
-      mantenimiento aproximado que correspondería al vehículo
-      considerando el tiempo transcurrido hasta hoy.
+    2. Para cualquier otro estado:
+       - kilometraje_esperado_actual =
+         kilometraje_siguiente_ciclo;
+       - fecha_politica se mantiene sin modificaciones.
 
-    Para avanzar el ciclo se utiliza la cadencia temporal
-    de política de 6 meses.
-
-    Si la fecha del siguiente ciclo todavía no ha vencido,
-    ambos valores coinciden.
-
-    Si la fecha ya pasó, se avanza un ciclo por cada bloque
-    de 6 meses, considerando también el ciclo actualmente
-    en curso.
+    Importante:
+    kilometraje_esperado_actual representa un nivel
+    preventivo estimado, no el odómetro real del vehículo.
     """
 
     if base.empty:
@@ -4472,133 +4471,209 @@ def agregar_kilometraje_esperado_actual(
         base.copy()
     )
 
-    # El campo existente pasa a representar explícitamente
-    # el siguiente ciclo inmediatamente posterior.
-    resultado = resultado.rename(
-        columns={
-            "kilometraje_esperado":
-                "kilometraje_siguiente_ciclo",
-        }
-    )
+    # --------------------------------------------------------
+    # 1. Renombrar el antiguo kilometraje_esperado
+    # --------------------------------------------------------
+
+    if (
+        "kilometraje_siguiente_ciclo"
+        not in resultado.columns
+    ):
+
+        resultado = resultado.rename(
+            columns={
+                "kilometraje_esperado":
+                    "kilometraje_siguiente_ciclo",
+            }
+        )
+
+    # --------------------------------------------------------
+    # 2. Valor por defecto:
+    #    todos conservan el siguiente ciclo
+    # --------------------------------------------------------
 
     resultado[
         "kilometraje_esperado_actual"
     ] = (
-        resultado[
-            "kilometraje_siguiente_ciclo"
-        ]
-        .copy()
+        pd.to_numeric(
+            resultado[
+                "kilometraje_siguiente_ciclo"
+            ],
+            errors="coerce",
+        )
+        .astype("Int64")
     )
 
-    fecha_generacion = pd.to_datetime(
-        resultado[
-            "fecha_generacion"
-        ],
-        errors="coerce",
+    # --------------------------------------------------------
+    # 3. Normalizar fechas
+    # --------------------------------------------------------
+
+    if fecha_generacion is None:
+        fecha_corte = pd.Timestamp.today().normalize()
+    else:
+        fecha_corte = pd.Timestamp(
+            fecha_generacion
+        ).normalize()
+
+    resultado[
+        "fecha_generacion"
+    ] = fecha_corte
+
+    fechas_generacion = pd.Series(
+        fecha_corte,
+        index=resultado.index,
     )
 
-    fecha_politica = pd.to_datetime(
+    fechas_politica = pd.to_datetime(
         resultado[
             "fecha_politica"
         ],
         errors="coerce",
     )
 
-    kilometrajes_actuales = []
+    kilometrajes_actualizados = []
+    fechas_politica_actualizadas = []
+
+    # --------------------------------------------------------
+    # 4. Evaluar VIN por VIN
+    # --------------------------------------------------------
 
     for (
         km_siguiente,
-        fecha_objetivo,
-        fecha_corte,
+        fecha_politica_original,
+        fecha_generacion,
     ) in zip(
         resultado[
             "kilometraje_siguiente_ciclo"
         ],
-        fecha_politica,
-        fecha_generacion,
+        fechas_politica,
+        fechas_generacion,
     ):
 
-        km_siguiente = _km_a_numero(
+        km_actual = _km_a_numero(
             km_siguiente
         )
 
-        if (
-            km_siguiente is None
-            or pd.isna(fecha_objetivo)
-            or pd.isna(fecha_corte)
-        ):
-
-            kilometrajes_actuales.append(
-                km_siguiente
-            )
-            continue
-
-        # Si el siguiente mantenimiento todavía no vence,
-        # ese sigue siendo el mantenimiento esperado.
-        if fecha_corte <= fecha_objetivo:
-
-            kilometrajes_actuales.append(
-                km_siguiente
-            )
-            continue
-
-        # ----------------------------------------------------
-        # Meses transcurridos desde la fecha política que
-        # correspondía al siguiente mantenimiento.
-        # ----------------------------------------------------
-
-        meses_transcurridos = (
-            (
-                fecha_corte.year
-                -
-                fecha_objetivo.year
-            )
-            * 12
-            +
-            (
-                fecha_corte.month
-                -
-                fecha_objetivo.month
-            )
+        fecha_actualizada = (
+            fecha_politica_original
         )
 
-        # Ajuste cuando todavía no se alcanzó el día del mes.
+        # ----------------------------------------------------
+        # Sin datos suficientes:
+        # conservar lo existente
+        # ----------------------------------------------------
+
         if (
-            fecha_corte.day
+            km_actual is None
+            or pd.isna(
+                fecha_politica_original
+            )
+            or pd.isna(
+                fecha_generacion
+            )
+        ):
+
+            kilometrajes_actualizados.append(
+                km_actual
+            )
+
+            fechas_politica_actualizadas.append(
+                fecha_actualizada
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Determinar atraso respecto de la política ORIGINAL
+        # ----------------------------------------------------
+
+        dias_atraso_original = (
+            fecha_generacion.normalize()
+            -
+            fecha_politica_original.normalize()
+        ).days
+
+        es_vencido_lejano = (
+            dias_atraso_original
+            >= 180
+        )
+
+        # ----------------------------------------------------
+        # No es VENCIDO_LEJANO:
+        # no avanzar ni KM ni fecha
+        # ----------------------------------------------------
+
+        if not es_vencido_lejano:
+
+            kilometrajes_actualizados.append(
+                km_actual
+            )
+
+            fechas_politica_actualizadas.append(
+                fecha_actualizada
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # VENCIDO_LEJANO:
+        # avanzar KM y fecha juntos hasta encontrar
+        # el próximo ciclo vigente/futuro
+        # ----------------------------------------------------
+
+        while (
+            fecha_actualizada.normalize()
             <
-            fecha_objetivo.day
+            fecha_generacion.normalize()
         ):
-            meses_transcurridos -= 1
 
-        # El km_siguiente ya representa el primer ciclo.
-        # Por eso calculamos cuántos ciclos ADICIONALES
-        # corresponden después de esa fecha.
-        ciclos_adicionales = (
-            meses_transcurridos
-            // 6
-            +
-            1
-        )
-
-        km_actual = (
-            _avanzar_mantenimiento_por_ciclos(
-                mantenimiento_base=
-                    km_siguiente,
-                ciclos=
-                    ciclos_adicionales,
+            siguiente_km = (
+                _siguiente_mantenimiento_km(
+                    km_actual
+                )
             )
-        )
 
-        kilometrajes_actuales.append(
+            if siguiente_km is None:
+                break
+
+            km_actual = siguiente_km
+
+            fecha_actualizada = (
+                fecha_actualizada
+                +
+                pd.DateOffset(
+                    months=6
+                )
+            )
+
+        kilometrajes_actualizados.append(
             km_actual
         )
+
+        fechas_politica_actualizadas.append(
+            fecha_actualizada
+        )
+
+    # --------------------------------------------------------
+    # 5. Guardar resultados
+    # --------------------------------------------------------
 
     resultado[
         "kilometraje_esperado_actual"
     ] = pd.Series(
-        kilometrajes_actuales,
+        kilometrajes_actualizados,
         index=resultado.index,
         dtype="Int64",
+    )
+
+    resultado[
+        "fecha_politica"
+    ] = pd.to_datetime(
+        pd.Series(
+            fechas_politica_actualizadas,
+            index=resultado.index,
+        ),
+        errors="coerce",
     )
 
     return resultado
@@ -4614,9 +4689,10 @@ def construir_historial_analitico(
     ventana_dias: int = VENTANA_VISITA_DIAS,
 ) -> dict:
     """
-    Punto de entrada oficial del historial preventivo.
+    Punto de entrada oficial del Motor CGO de Demanda
+    Proyectada.
 
-    Construye:
+    Construye de punta a punta:
 
     1. visitas analíticas;
     2. secuencia preventiva;
@@ -4625,11 +4701,21 @@ def construir_historial_analitico(
     5. intervalos históricos;
     6. resumen de intervalos;
     7. referencias históricas jerárquicas;
-    8. auditoría de cobertura.
+    8. auditoría de referencias;
+    9. estado actual del VIN;
+    10. proyección histórica;
+    11. cobertura histórica;
+    12. referencias ENTREGA -> 1K;
+    13. PANA sin historial;
+    14. política preventiva;
+    15. ajuste comercial del mantenimiento esperado;
+    16. estados temporales definitivos;
+    17. auditorías finales;
+    18. BASE_DEMANDA.
     """
 
     # --------------------------------------------------------
-    # 1. Asignar registros a visitas
+    # 1. Asignar registros a visitas analíticas
     # --------------------------------------------------------
 
     registros_con_visita = (
@@ -4642,7 +4728,7 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 2. Consolidar órdenes
+    # 2. Consolidar órdenes en visitas
     # --------------------------------------------------------
 
     visitas = (
@@ -4652,7 +4738,7 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 3. Reconstruir secuencia
+    # 3. Reconstruir secuencia preventiva
     # --------------------------------------------------------
 
     secuencia = (
@@ -4662,7 +4748,7 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 4. Construir trayectorias
+    # 4. Construir trayectorias por VIN
     # --------------------------------------------------------
 
     trayectorias = (
@@ -4690,7 +4776,7 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 6. Intervalos históricos
+    # 6. Construir intervalos históricos
     # --------------------------------------------------------
 
     intervalos_historicos = (
@@ -4700,7 +4786,7 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 7. Resumen descriptivo
+    # 7. Resumen descriptivo de intervalos
     # --------------------------------------------------------
 
     resumen_intervalos = (
@@ -4710,7 +4796,7 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 8. Referencias históricas
+    # 8. Construir referencias históricas jerárquicas
     # --------------------------------------------------------
 
     referencias_historicas = (
@@ -4720,7 +4806,7 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 9. Auditoría de cobertura
+    # 9. Auditoría de cobertura de referencias
     # --------------------------------------------------------
 
     auditoria_referencias = (
@@ -4730,7 +4816,7 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 10. Estado actual de cada VIN
+    # 10. Estado actual de cada VIN con historial
     # --------------------------------------------------------
 
     estado_actual = (
@@ -4746,13 +4832,15 @@ def construir_historial_analitico(
 
     proyeccion_historica = (
         proyectar_fecha_historica(
-            estado_actual=estado_actual,
-            referencias=referencias_historicas,
+            estado_actual=
+                estado_actual,
+            referencias=
+                referencias_historicas,
         )
     )
 
     # --------------------------------------------------------
-    # 12. Cobertura real de la proyección
+    # 12. Cobertura real de la proyección histórica
     # --------------------------------------------------------
 
     cobertura_proyeccion_historica = (
@@ -4762,7 +4850,7 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 13. PANA: referencias ENTREGA -> 1K
+    # 13. PANA — Referencias ENTREGA -> 1K
     # --------------------------------------------------------
 
     intervalos_entrega_1k = (
@@ -4806,7 +4894,8 @@ def construir_historial_analitico(
         construir_fecha_politica_con_historial(
             proyeccion_historica=
                 proyeccion_historica,
-            retail=retail,
+            retail=
+                retail,
         )
     )
 
@@ -4821,40 +4910,108 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 17. Estados temporales — VIN con historial
+    # 17. Fecha única de generación del motor
+    # --------------------------------------------------------
+
+    fecha_generacion_motor = (
+        pd.Timestamp.today()
+        .normalize()
+    )
+
+    # --------------------------------------------------------
+    # 18. Ajuste comercial — VIN con historial
+    #
+    # Solo los VENCIDO_LEJANO avanzan:
+    # - kilometraje_esperado_actual
+    # - fecha_politica
+    #
+    # El resto mantiene:
+    # kilometraje_esperado_actual =
+    # kilometraje_siguiente_ciclo
+    # --------------------------------------------------------
+
+    proyeccion_con_politica = (
+        agregar_kilometraje_esperado_actual(
+            base=
+                proyeccion_con_politica,
+            fecha_generacion=
+                fecha_generacion_motor,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 19. Ajuste comercial — PANA sin historial
+    # --------------------------------------------------------
+
+    proyeccion_pana_sin_historial = (
+        agregar_kilometraje_esperado_actual(
+            base=
+                proyeccion_pana_sin_historial,
+            fecha_generacion=
+                fecha_generacion_motor,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 20. Estados temporales definitivos — VIN con historial
+    #
+    # Se calculan DESPUÉS del ajuste comercial porque
+    # fecha_politica puede haber cambiado.
     # --------------------------------------------------------
 
     proyeccion_con_estados = (
         agregar_estados_temporales(
-            proyeccion_con_politica
+            base=
+                proyeccion_con_politica,
+            fecha_generacion=
+                fecha_generacion_motor,
         )
     )
 
     # --------------------------------------------------------
-    # 18. Estados temporales — PANA sin historial
+    # 21. Estados temporales definitivos — PANA sin historial
     # --------------------------------------------------------
 
     proyeccion_pana_sin_historial = (
         agregar_estados_temporales(
-            proyeccion_pana_sin_historial
-        )
-    )
-
-
-    proyeccion_con_estados = (
-        agregar_kilometraje_esperado_actual(
-            proyeccion_con_estados
-        )
-    )
-
-    proyeccion_pana_sin_historial = (
-        agregar_kilometraje_esperado_actual(
-            proyeccion_pana_sin_historial
+            base=
+                proyeccion_pana_sin_historial,
+            fecha_generacion=
+                fecha_generacion_motor,
         )
     )
 
     # --------------------------------------------------------
-    # Base operacional consolidada
+    # 22. Auditoría definitiva de política
+    #
+    # Se ejecuta después del ajuste comercial para auditar
+    # las fechas políticas finales.
+    # --------------------------------------------------------
+
+    auditoria_politica = (
+        auditar_proyeccion_politica(
+            con_historial=
+                proyeccion_con_estados,
+            pana_sin_historial=
+                proyeccion_pana_sin_historial,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 23. Auditoría definitiva de estados temporales
+    # --------------------------------------------------------
+
+    auditoria_estados = (
+        auditar_estados_temporales(
+            con_historial=
+                proyeccion_con_estados,
+            pana_sin_historial=
+                proyeccion_pana_sin_historial,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 24. Construir BASE_DEMANDA
     # --------------------------------------------------------
 
     base_demanda = (
@@ -4868,6 +5025,10 @@ def construir_historial_analitico(
         )
     )
 
+    # --------------------------------------------------------
+    # 25. Auditoría final de BASE_DEMANDA
+    # --------------------------------------------------------
+
     auditoria_base_demanda = (
         auditar_base_demanda(
             base_demanda
@@ -4875,36 +5036,14 @@ def construir_historial_analitico(
     )
 
     # --------------------------------------------------------
-    # 19. Auditoría de estados
-    # --------------------------------------------------------
-
-    auditoria_estados = (
-        auditar_estados_temporales(
-            con_historial=
-                proyeccion_con_estados,
-            pana_sin_historial=
-                proyeccion_pana_sin_historial,
-        )
-    )
-
-    # --------------------------------------------------------
-    # 20. Auditoría de política
-    # --------------------------------------------------------
-
-    auditoria_politica = (
-        auditar_proyeccion_politica(
-            con_historial=
-                proyeccion_con_politica,
-            pana_sin_historial=
-                proyeccion_pana_sin_historial,
-        )
-    )
-
-    # --------------------------------------------------------
-    # 21. Resultado
+    # 26. Resultado
     # --------------------------------------------------------
 
     return {
+        # ----------------------------------------------------
+        # Visitas y secuencia
+        # ----------------------------------------------------
+
         "registros_con_visita":
             registros_con_visita,
 
@@ -4920,6 +5059,10 @@ def construir_historial_analitico(
         "auditoria_visitas":
             auditoria_visitas,
 
+        # ----------------------------------------------------
+        # Intervalos y referencias históricas
+        # ----------------------------------------------------
+
         "intervalos_historicos":
             intervalos_historicos,
 
@@ -4932,6 +5075,10 @@ def construir_historial_analitico(
         "auditoria_referencias":
             auditoria_referencias,
 
+        # ----------------------------------------------------
+        # Estado y proyección histórica
+        # ----------------------------------------------------
+
         "estado_actual":
             estado_actual,
 
@@ -4940,6 +5087,10 @@ def construir_historial_analitico(
 
         "cobertura_proyeccion_historica":
             cobertura_proyeccion_historica,
+
+        # ----------------------------------------------------
+        # PANA sin historial
+        # ----------------------------------------------------
 
         "intervalos_entrega_1k":
             intervalos_entrega_1k,
@@ -4950,11 +5101,15 @@ def construir_historial_analitico(
         "pana_sin_historial":
             pana_sin_historial,
 
-        # "proyeccion_pana_sin_historial":
-        #    proyeccion_pana_sin_historial,
+        # ----------------------------------------------------
+        # Política y estados finales
+        # ----------------------------------------------------
 
         "proyeccion_con_politica":
             proyeccion_con_politica,
+
+        "proyeccion_con_estados":
+            proyeccion_con_estados,
 
         "proyeccion_pana_sin_historial":
             proyeccion_pana_sin_historial,
@@ -4962,17 +5117,16 @@ def construir_historial_analitico(
         "auditoria_politica":
             auditoria_politica,
 
-        "proyeccion_con_estados":
-            proyeccion_con_estados,
-
         "auditoria_estados":
             auditoria_estados,
+
+        # ----------------------------------------------------
+        # Base operacional final
+        # ----------------------------------------------------
 
         "base_demanda":
             base_demanda,
 
         "auditoria_base_demanda":
             auditoria_base_demanda,
-
-
     }
