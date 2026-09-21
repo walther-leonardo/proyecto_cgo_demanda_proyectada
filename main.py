@@ -328,15 +328,13 @@ def ejecutar_motor(
         ),
         log_callback,
     )
-
+    
+    #🐶
     historial = (
         construir_historial_analitico(
-            historia_preventiva=
-                historia_preventiva,
-            retail=
-                retail_preparado,
-            clientes=
-                clientes_preparado,
+            historia_preventiva= historia_preventiva,
+            retail= retail_preparado,
+            clientes=  clientes_preparado,
         )
     )
 

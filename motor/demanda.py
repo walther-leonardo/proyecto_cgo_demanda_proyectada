@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import numpy as np
 
 
 # ============================================================
@@ -256,15 +257,32 @@ def asignar_visitas_analiticas(
     Toma los preventivos con KM interpretable y asigna
     una visita analítica a cada registro.
 
-    Los preventivos sin KM permanecen en la auditoría,
-    pero no participan en la secuencia preventiva.
+    Versión optimizada:
+    - ordena una sola vez;
+    - evita crear un DataFrame por cada VIN;
+    - evita groupby + concat;
+    - recorre la base completa una sola vez.
+
+    La ventana se mantiene calculada desde la primera
+    fecha de cada visita, igual que en la lógica original.
     """
+
+    # --------------------------------------------------------
+    # 1. Preventivos válidos para secuencia
+    # --------------------------------------------------------
 
     base = historia_preventiva.loc[
         historia_preventiva[
             "mantenimiento_km"
         ].notna()
     ].copy()
+
+    if base.empty:
+        return base
+
+    # --------------------------------------------------------
+    # 2. Orden único
+    # --------------------------------------------------------
 
     base = (
         base
@@ -280,45 +298,106 @@ def asignar_visitas_analiticas(
         )
     )
 
-    grupos = []
+    # --------------------------------------------------------
+    # 3. Extraer arrays
+    #
+    # A partir de aquí evitamos trabajar fila por fila
+    # mediante objetos Series/DataFrame de Pandas.
+    # --------------------------------------------------------
 
-    for _, grupo in base.groupby(
-        "vin",
-        sort=False,
-    ):
+    vins = (
+        base["vin"]
+        .to_numpy()
+    )
 
-        grupos.append(
-            _asignar_visitas_por_vin(
-                grupo=grupo,
-                ventana_dias=ventana_dias,
-            )
+    fechas = (
+        pd.to_datetime(
+            base["fecha_orden"]
         )
-
-    if not grupos:
-        return base
-
-    resultado = (
-        pd.concat(
-            grupos,
-            ignore_index=True,
-        )
-        .sort_values(
-            [
-                "vin",
-                "fecha_orden",
-                "Id doc",
-            ]
-        )
-        .reset_index(
-            drop=True
+        .to_numpy(
+            dtype="datetime64[D]"
         )
     )
 
-    return resultado
+    numeros_visita = np.empty(
+        len(base),
+        dtype=np.int32,
+    )
 
+    # --------------------------------------------------------
+    # 4. Recorrido único de toda la historia
+    # --------------------------------------------------------
+
+    vin_anterior = None
+    inicio_visita = None
+    numero_visita = 0
+
+    for i in range(len(base)):
+
+        vin_actual = vins[i]
+        fecha_actual = fechas[i]
+
+        # ----------------------------------------------------
+        # Nuevo VIN
+        # ----------------------------------------------------
+
+        if (
+            i == 0
+            or vin_actual != vin_anterior
+        ):
+
+            numero_visita = 1
+            inicio_visita = fecha_actual
+
+        # ----------------------------------------------------
+        # Mismo VIN
+        # ----------------------------------------------------
+
+        else:
+
+            dias_desde_inicio = int(
+                (
+                    fecha_actual
+                    - inicio_visita
+                )
+                / np.timedelta64(
+                    1,
+                    "D",
+                )
+            )
+
+            if (
+                dias_desde_inicio
+                > ventana_dias
+            ):
+
+                numero_visita += 1
+                inicio_visita = fecha_actual
+
+        numeros_visita[i] = (
+            numero_visita
+        )
+
+        vin_anterior = (
+            vin_actual
+        )
+
+    # --------------------------------------------------------
+    # 5. Incorporar resultado
+    # --------------------------------------------------------
+
+    base[
+        "nro_visita_analitica"
+    ] = numeros_visita
+
+    return base
 
 # ============================================================
 # CONSOLIDACIÓN DE VISITAS
+# ============================================================
+
+# ============================================================
+# CONSOLIDACIÓN DE VISITAS — VERSIÓN OPTIMIZADA
 # ============================================================
 
 def consolidar_visitas_preventivas(
@@ -328,22 +407,20 @@ def consolidar_visitas_preventivas(
     Consolida todas las órdenes pertenecientes a una misma
     visita analítica.
 
-    Se utiliza la última orden de la visita como registro
-    representativo para:
-
-    - mantenimiento KM;
-    - cliente;
-    - placa;
-    - modelo;
-    - sede;
-    - asesor;
-    - número de orden.
-
-    La fecha analítica de la visita será la primera fecha
-    observada dentro de la ventana.
+    Versión optimizada:
+    - ordena una sola vez;
+    - evita iterar grupo por grupo;
+    - usa groupby.agg para consolidar;
+    - conserva la misma lógica de negocio.
     """
 
-    filas = []
+    if registros_con_visita.empty:
+        return pd.DataFrame()
+
+    claves = [
+        "vin",
+        "nro_visita_analitica",
+    ]
 
     columnas_representativas = [
         "Id doc",
@@ -359,123 +436,265 @@ def consolidar_visitas_preventivas(
         "parque",
     ]
 
-    for (
-        vin,
-        nro_visita,
-    ), grupo in registros_con_visita.groupby(
-        [
-            "vin",
-            "nro_visita_analitica",
-        ],
-        sort=False,
-    ):
+    # --------------------------------------------------------
+    # 1. Ordenar una sola vez
+    # --------------------------------------------------------
 
-        grupo = (
-            grupo
-            .sort_values(
-                [
-                    "fecha_orden",
-                    "Id doc",
-                ]
-            )
-        )
-
-        representante = (
-            grupo.iloc[-1]
-        )
-
-        fila = {
-            "vin":
-                vin,
-
-            "nro_visita_analitica":
-                int(
-                    nro_visita
-                ),
-
-            "fecha_visita":
-                grupo[
-                    "fecha_orden"
-                ].min(),
-
-            "fecha_ultima_orden_visita":
-                grupo[
-                    "fecha_orden"
-                ].max(),
-
-            "n_registros_visita":
-                len(
-                    grupo
-                ),
-
-            "n_ordenes_visita":
-                grupo[
-                    "Id doc"
-                ].nunique(
-                    dropna=True
-                ),
-
-            "n_km_distintos_visita":
-                grupo[
-                    "mantenimiento_km"
-                ].nunique(
-                    dropna=True
-                ),
-
-            "n_documentos_distintos_visita":
-                grupo[
-                    "nro documento"
-                ].nunique(
-                    dropna=True
-                ),
-
-            "n_placas_distintas_visita":
-                grupo[
-                    "placa"
-                ].nunique(
-                    dropna=True
-                ),
-
-            "km_distintos_visita":
-                _serie_km_distintos(
-                    grupo[
-                        "mantenimiento_km"
-                    ]
-                ),
-
-            "documentos_distintos_visita":
-                _serie_valores_distintos(
-                    grupo[
-                        "nro documento"
-                    ]
-                ),
-
-            "placas_distintas_visita":
-                _serie_valores_distintos(
-                    grupo[
-                        "placa"
-                    ]
-                ),
-        }
-
-        for columna in columnas_representativas:
-
-            fila[
-                columna
-            ] = representante[
-                columna
+    base = (
+        registros_con_visita
+        .sort_values(
+            [
+                "vin",
+                "nro_visita_analitica",
+                "fecha_orden",
+                "Id doc",
             ]
-
-        filas.append(
-            fila
         )
-
-    visitas = pd.DataFrame(
-        filas
+        .reset_index(drop=True)
     )
 
-    if visitas.empty:
-        return visitas
+    # --------------------------------------------------------
+    # 2. Agregaciones principales
+    # --------------------------------------------------------
+
+    visitas = (
+        base
+        .groupby(
+            claves,
+            sort=False,
+            observed=True,
+        )
+        .agg(
+            fecha_visita=(
+                "fecha_orden",
+                "min",
+            ),
+
+            fecha_ultima_orden_visita=(
+                "fecha_orden",
+                "max",
+            ),
+
+            n_registros_visita=(
+                "fecha_orden",
+                "size",
+            ),
+
+            n_ordenes_visita=(
+                "Id doc",
+                "nunique",
+            ),
+
+            n_km_distintos_visita=(
+                "mantenimiento_km",
+                "nunique",
+            ),
+
+            n_documentos_distintos_visita=(
+                "nro documento",
+                "nunique",
+            ),
+
+            n_placas_distintas_visita=(
+                "placa",
+                "nunique",
+            ),
+        )
+        .reset_index()
+    )
+
+    # --------------------------------------------------------
+    # 3. Registro representativo = última orden de la visita
+    # --------------------------------------------------------
+
+    representantes = (
+        base
+        .drop_duplicates(
+            subset=claves,
+            keep="last",
+        )[
+            claves
+            + columnas_representativas
+        ]
+    )
+
+    visitas = visitas.merge(
+        representantes,
+        on=claves,
+        how="left",
+        validate="one_to_one",
+    )
+
+    # --------------------------------------------------------
+    # 4. Valores distintos auditables — OPTIMIZADO
+    #
+    # Evitamos ejecutar funciones Python personalizadas para
+    # cada visita. Los duplicados se eliminan globalmente una
+    # sola vez y luego únicamente se concatenan los valores.
+    # --------------------------------------------------------
+
+    # ========================================================
+    # 4.1 KM distintos
+    #
+    # La lógica original:
+    # - ignora nulos
+    # - elimina duplicados
+    # - ordena los KM ascendentemente
+    # - aplica la etiqueta comercial
+    # ========================================================
+
+    km_unicos = (
+        base.loc[
+            base["mantenimiento_km"].notna(),
+            claves + ["mantenimiento_km"],
+        ]
+        .drop_duplicates(
+            subset=claves + ["mantenimiento_km"],
+            keep="first",
+        )
+        .sort_values(
+            claves + ["mantenimiento_km"]
+        )
+        .copy()
+    )
+
+    km_unicos["_etiqueta_km"] = (
+        km_unicos["mantenimiento_km"]
+        .map(_etiqueta_km)
+    )
+
+    km_distintos = (
+        km_unicos
+        .groupby(
+            claves,
+            sort=False,
+            observed=True,
+        )["_etiqueta_km"]
+        .agg(" | ".join)
+        .rename("km_distintos_visita")
+        .reset_index()
+    )
+
+
+    # ========================================================
+    # 4.2 Documentos distintos
+    #
+    # La lógica original conserva el primer orden de aparición.
+    # Como "base" ya está ordenada, basta con eliminar
+    # duplicados globalmente conservando el primero.
+    # ========================================================
+
+    documentos_unicos = (
+        base.loc[
+            base["nro documento"].notna(),
+            claves + ["nro documento"],
+        ]
+        .drop_duplicates(
+            subset=claves + ["nro documento"],
+            keep="first",
+        )
+        .copy()
+    )
+
+    documentos_unicos["_valor"] = (
+        documentos_unicos["nro documento"]
+        .astype(str)
+    )
+
+    documentos_distintos = (
+        documentos_unicos
+        .groupby(
+            claves,
+            sort=False,
+            observed=True,
+        )["_valor"]
+        .agg(" | ".join)
+        .rename("documentos_distintos_visita")
+        .reset_index()
+    )
+
+
+    # ========================================================
+    # 4.3 Placas distintas
+    # ========================================================
+
+    placas_unicas = (
+        base.loc[
+            base["placa"].notna(),
+            claves + ["placa"],
+        ]
+        .drop_duplicates(
+            subset=claves + ["placa"],
+            keep="first",
+        )
+        .copy()
+    )
+
+    placas_unicas["_valor"] = (
+        placas_unicas["placa"]
+        .astype(str)
+    )
+
+    placas_distintas = (
+        placas_unicas
+        .groupby(
+            claves,
+            sort=False,
+            observed=True,
+        )["_valor"]
+        .agg(" | ".join)
+        .rename("placas_distintas_visita")
+        .reset_index()
+    )
+
+
+    # ========================================================
+    # 4.4 Incorporar las tres auditorías
+    # ========================================================
+
+    visitas = visitas.merge(
+        km_distintos,
+        on=claves,
+        how="left",
+        validate="one_to_one",
+    )
+
+    visitas = visitas.merge(
+        documentos_distintos,
+        on=claves,
+        how="left",
+        validate="one_to_one",
+    )
+
+    visitas = visitas.merge(
+        placas_distintas,
+        on=claves,
+        how="left",
+        validate="one_to_one",
+    )
+
+
+    # ========================================================
+    # 4.5 Grupos sin valores válidos
+    #
+    # La implementación anterior devolvía "" cuando no había
+    # valores. Conservamos exactamente ese comportamiento.
+    # ========================================================
+
+    columnas_texto_auditoria = [
+        "km_distintos_visita",
+        "documentos_distintos_visita",
+        "placas_distintas_visita",
+    ]
+
+    visitas[columnas_texto_auditoria] = (
+        visitas[columnas_texto_auditoria]
+        .fillna("")
+    )
+
+    # --------------------------------------------------------
+    # 5. Flags
+    # --------------------------------------------------------
 
     visitas[
         "visita_km_multiple"
@@ -504,6 +723,10 @@ def consolidar_visitas_preventivas(
         > 1
     )
 
+    # --------------------------------------------------------
+    # 6. Orden final
+    # --------------------------------------------------------
+
     visitas = (
         visitas
         .sort_values(
@@ -519,7 +742,6 @@ def consolidar_visitas_preventivas(
     )
 
     return visitas
-
 
 # ============================================================
 # COMPORTAMIENTO DE SECUENCIA
@@ -872,6 +1094,9 @@ def _construir_trayectoria_completa(
     """
     Construye una trayectoria temporal legible.
 
+    El grupo recibido debe venir previamente ordenado
+    por fecha_visita.
+
     Ejemplo:
         ENTREGA →(30)→ 1K →(150)→ 5K →(360)→ 20K
         →(e)→ 5K
@@ -882,58 +1107,62 @@ def _construir_trayectoria_completa(
     Los saltos conservan los días reales observados.
     """
 
-    grupo = (
-        grupo
-        .sort_values(
-            "fecha_visita"
-        )
+    if grupo.empty:
+        return ""
+
+    mantenimientos = (
+        grupo["mantenimiento_km"]
+        .to_numpy()
+    )
+
+    fechas = (
+        grupo["fecha_visita"]
+        .to_numpy()
+    )
+
+    comportamientos = (
+        grupo["comportamiento"]
+        .to_numpy()
+    )
+
+    dias_anteriores = (
+        grupo[
+            "dias_desde_visita_anterior"
+        ]
+        .to_numpy()
     )
 
     partes = []
 
-    primera_fila = (
-        grupo.iloc[0]
-    )
-
-    primera_fecha = (
-        primera_fila[
-            "fecha_visita"
-        ]
+    primera_fecha = pd.Timestamp(
+        fechas[0]
     )
 
     primera_etiqueta = (
         _etiqueta_km(
-            primera_fila[
-                "mantenimiento_km"
-            ]
+            mantenimientos[0]
         )
     )
 
+    # --------------------------------------------------------
+    # ENTREGA → primera visita
+    # --------------------------------------------------------
+
     if (
         fecha_entrega is not None
-        and pd.notna(
-            fecha_entrega
-        )
+        and pd.notna(fecha_entrega)
     ):
 
         dias_entrega = (
             primera_fecha
-            -
-            fecha_entrega
+            - pd.Timestamp(fecha_entrega)
         ).days
 
-        partes.append(
-            "ENTREGA"
-        )
+        partes.append("ENTREGA")
 
         if dias_entrega < 0:
-
-            partes.append(
-                "→(e)→"
-            )
-
+            partes.append("→(e)→")
         else:
-
             partes.append(
                 f"→({dias_entrega})→"
             )
@@ -948,21 +1177,23 @@ def _construir_trayectoria_completa(
             primera_etiqueta
         )
 
-    filas = list(
-        grupo.itertuples(
-            index=False
-        )
-    )
+    # --------------------------------------------------------
+    # Resto de visitas
+    # --------------------------------------------------------
 
-    for fila in filas[1:]:
-
-        comportamiento = (
-            fila.comportamiento
-        )
+    for (
+        mantenimiento,
+        comportamiento,
+        dias,
+    ) in zip(
+        mantenimientos[1:],
+        comportamientos[1:],
+        dias_anteriores[1:],
+    ):
 
         etiqueta = (
             _etiqueta_km(
-                fila.mantenimiento_km
+                mantenimiento
             )
         )
 
@@ -975,25 +1206,17 @@ def _construir_trayectoria_completa(
                 "→(e)→"
             )
 
-        else:
+        elif pd.isna(dias):
 
-            dias = (
-                fila.dias_desde_visita_anterior
+            partes.append(
+                "→(?)→"
             )
 
-            if pd.isna(
-                dias
-            ):
+        else:
 
-                partes.append(
-                    "→(?)→"
-                )
-
-            else:
-
-                partes.append(
-                    f"→({int(dias)})→"
-                )
+            partes.append(
+                f"→({int(dias)})→"
+            )
 
         partes.append(
             etiqueta
@@ -1010,164 +1233,226 @@ def construir_trayectorias_vin(
 ) -> pd.DataFrame:
     """
     Genera una fila resumen de trayectoria por VIN.
+
+    Versión optimizada:
+    - ordena la secuencia una sola vez;
+    - calcula métricas resumen mediante groupby;
+    - evita accesos repetidos grupo por grupo;
+    - reserva el recorrido por VIN únicamente para construir
+      las trayectorias textuales.
     """
 
     if secuencia.empty:
         return pd.DataFrame()
 
+    # --------------------------------------------------------
+    # 1. Ordenar una sola vez toda la secuencia
+    # --------------------------------------------------------
+
+    base = (
+        secuencia
+        .sort_values(
+            [
+                "vin",
+                "fecha_visita",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    # --------------------------------------------------------
+    # 2. Fecha de entrega por VIN PANA
+    # --------------------------------------------------------
+
     fechas_entrega = (
         retail.loc[
-            retail[
-                "vin"
-            ].notna(),
+            retail["vin"].notna(),
             [
                 "vin",
                 "fecha_entrega",
             ],
         ]
         .drop_duplicates(
-            subset=[
-                "vin",
-            ],
+            subset=["vin"],
             keep="last",
         )
-        .set_index(
-            "vin"
-        )[
-            "fecha_entrega"
-        ]
-        .to_dict()
+        .rename(
+            columns={
+                "fecha_entrega":
+                    "fecha_entrega_retail",
+            }
+        )
     )
 
-    filas = []
+    # --------------------------------------------------------
+    # 3. Métricas resumen vectorizadas por VIN
+    # --------------------------------------------------------
 
-    for vin, grupo in secuencia.groupby(
+    resumen = (
+        base
+        .groupby(
+            "vin",
+            sort=False,
+            observed=True,
+        )
+        .agg(
+            parque=(
+                "parque",
+                "last",
+            ),
+
+            visitas_preventivas=(
+                "fecha_visita",
+                "size",
+            ),
+
+            fecha_primera_visita=(
+                "fecha_visita",
+                "first",
+            ),
+
+            fecha_ultima_visita=(
+                "fecha_visita",
+                "last",
+            ),
+
+            kilometraje_primera_visita=(
+                "mantenimiento_km",
+                "first",
+            ),
+
+            kilometraje_ultima_visita=(
+                "mantenimiento_km",
+                "last",
+            ),
+
+            cantidad_saltos=(
+                "es_salto_mantenimiento",
+                "sum",
+            ),
+
+            cantidad_retrocesos=(
+                "es_retroceso",
+                "sum",
+            ),
+
+            cantidad_repeticiones=(
+                "es_repeticion",
+                "sum",
+            ),
+
+            cantidad_inconsistencias=(
+                "es_inconsistencia_secuencia",
+                "sum",
+            ),
+
+            tiene_inconsistencia_secuencia=(
+                "es_inconsistencia_secuencia",
+                "any",
+            ),
+        )
+        .reset_index()
+    )
+
+    # --------------------------------------------------------
+    # 4. Última inconsistencia por VIN
+    # --------------------------------------------------------
+
+    inconsistencias = (
+        base.loc[
+            base[
+                "es_inconsistencia_secuencia"
+            ],
+            [
+                "vin",
+                "comportamiento",
+            ],
+        ]
+        .drop_duplicates(
+            subset=["vin"],
+            keep="last",
+        )
+        .rename(
+            columns={
+                "comportamiento":
+                    "ultima_inconsistencia",
+            }
+        )
+    )
+
+    resumen = resumen.merge(
+        inconsistencias,
+        on="vin",
+        how="left",
+        validate="one_to_one",
+    )
+
+    resumen[
+        "ultima_inconsistencia"
+    ] = (
+        resumen[
+            "ultima_inconsistencia"
+        ]
+        .fillna(pd.NA)
+    )
+
+    # --------------------------------------------------------
+    # 5. Kilometraje esperado siguiente
+    # --------------------------------------------------------
+
+    resumen[
+        "kilometraje_esperado"
+    ] = (
+        resumen[
+            "kilometraje_ultima_visita"
+        ]
+        .map(
+            _siguiente_mantenimiento_km
+        )
+    )
+
+    # --------------------------------------------------------
+    # 6. Incorporar fecha de entrega
+    # --------------------------------------------------------
+
+    resumen = resumen.merge(
+        fechas_entrega,
+        on="vin",
+        how="left",
+        validate="one_to_one",
+    )
+
+    fecha_entrega_por_vin = dict(
+        zip(
+            resumen["vin"],
+            resumen["fecha_entrega_retail"],
+        )
+    )
+
+    # --------------------------------------------------------
+    # 7. Construir únicamente las trayectorias textuales
+    # --------------------------------------------------------
+
+    trayectorias = []
+
+    for vin, grupo in base.groupby(
         "vin",
         sort=False,
+        observed=True,
     ):
 
-        grupo = (
-            grupo
-            .sort_values(
-                "fecha_visita"
-            )
-        )
-
-        parque = (
-            grupo[
-                "parque"
-            ]
-            .iloc[-1]
-        )
+        parque = grupo["parque"].iloc[-1]
 
         fecha_entrega = (
-            fechas_entrega.get(
-                vin
-            )
+            fecha_entrega_por_vin.get(vin)
             if parque == "PANA"
             else None
         )
 
-        inconsistencias = (
-            grupo.loc[
-                grupo[
-                    "es_inconsistencia_secuencia"
-                ],
-                "comportamiento",
-            ]
-        )
-
-        ultima_inconsistencia = (
-            inconsistencias.iloc[-1]
-            if not inconsistencias.empty
-            else pd.NA
-        )
-
-        ultima_fila = (
-            grupo.iloc[-1]
-        )
-
-        siguiente_km = (
-            _siguiente_mantenimiento_km(
-                ultima_fila[
-                    "mantenimiento_km"
-                ]
-            )
-        )
-
-        filas.append(
+        trayectorias.append(
             {
                 "vin":
                     vin,
-
-                "parque":
-                    parque,
-
-                "visitas_preventivas":
-                    len(
-                        grupo
-                    ),
-
-                "fecha_primera_visita":
-                    grupo[
-                        "fecha_visita"
-                    ].min(),
-
-                "fecha_ultima_visita":
-                    grupo[
-                        "fecha_visita"
-                    ].max(),
-
-                "kilometraje_primera_visita":
-                    grupo[
-                        "mantenimiento_km"
-                    ].iloc[0],
-
-                "kilometraje_ultima_visita":
-                    ultima_fila[
-                        "mantenimiento_km"
-                    ],
-
-                "kilometraje_esperado":
-                    siguiente_km,
-
-                "cantidad_saltos":
-                    int(
-                        grupo[
-                            "es_salto_mantenimiento"
-                        ].sum()
-                    ),
-
-                "cantidad_retrocesos":
-                    int(
-                        grupo[
-                            "es_retroceso"
-                        ].sum()
-                    ),
-
-                "cantidad_repeticiones":
-                    int(
-                        grupo[
-                            "es_repeticion"
-                        ].sum()
-                    ),
-
-                "cantidad_inconsistencias":
-                    int(
-                        grupo[
-                            "es_inconsistencia_secuencia"
-                        ].sum()
-                    ),
-
-                "tiene_inconsistencia_secuencia":
-                    bool(
-                        grupo[
-                            "es_inconsistencia_secuencia"
-                        ].any()
-                    ),
-
-                "ultima_inconsistencia":
-                    ultima_inconsistencia,
 
                 "trayectoria_observada":
                     _construir_trayectoria_observada(
@@ -1187,16 +1472,62 @@ def construir_trayectorias_vin(
             }
         )
 
+    trayectorias = pd.DataFrame(
+        trayectorias
+    )
+
+    # --------------------------------------------------------
+    # 8. Integrar textos con resumen
+    # --------------------------------------------------------
+
+    resultado = resumen.merge(
+        trayectorias,
+        on="vin",
+        how="left",
+        validate="one_to_one",
+    )
+
+    resultado = resultado.drop(
+        columns=[
+            "fecha_entrega_retail",
+        ],
+        errors="ignore",
+    )
+
+    # --------------------------------------------------------
+    # 9. Tipos equivalentes al motor original
+    # --------------------------------------------------------
+
+    for columna in [
+        "cantidad_saltos",
+        "cantidad_retrocesos",
+        "cantidad_repeticiones",
+        "cantidad_inconsistencias",
+    ]:
+        resultado[columna] = (
+            resultado[columna]
+            .fillna(0)
+            .astype(int)
+        )
+
+    resultado[
+        "tiene_inconsistencia_secuencia"
+    ] = (
+        resultado[
+            "tiene_inconsistencia_secuencia"
+        ]
+        .fillna(False)
+        .astype(bool)
+    )
+
+    # --------------------------------------------------------
+    # 10. Orden final
+    # --------------------------------------------------------
+
     return (
-        pd.DataFrame(
-            filas
-        )
-        .sort_values(
-            "vin"
-        )
-        .reset_index(
-            drop=True
-        )
+        resultado
+        .sort_values("vin")
+        .reset_index(drop=True)
     )
 
 
@@ -2507,37 +2838,316 @@ def proyectar_fecha_historica(
     """
     Asigna a cada VIN actual la mejor referencia histórica
     disponible y calcula su fecha histórica proyectada.
+
+    Versión optimizada:
+    aplica la jerarquía histórica mediante merges vectorizados,
+    evitando búsquedas fila por fila.
+
+    Jerarquía:
+    1. VIN propio
+    2. Parque + Modelo + Transición + Sede
+    3. Parque + Modelo + Transición
+    4. Parque + Transición
+    5. Transición general
+    6. Sin referencia
     """
 
     if estado_actual.empty:
         return estado_actual.copy()
 
-    resultado = (
-        estado_actual.copy()
-    )
+    resultado = estado_actual.copy()
 
-    asignaciones = [
-        _asignar_referencia_historica_fila(
-            fila=fila,
-            referencias=referencias,
+    # --------------------------------------------------------
+    # Preservar índice original
+    # --------------------------------------------------------
+
+    resultado["_indice_original"] = resultado.index
+
+    # --------------------------------------------------------
+    # Inicializar resultado de referencia
+    # --------------------------------------------------------
+
+    resultado["dias_historicos_estimados"] = pd.NA
+    resultado["metodo_historico"] = "SIN_REFERENCIA_HISTORICA"
+    resultado["n_referencias_historicas"] = 0
+
+    # ========================================================
+    # FUNCIÓN INTERNA PARA APLICAR UN NIVEL DE LA JERARQUÍA
+    # ========================================================
+
+    def aplicar_referencia(
+        base: pd.DataFrame,
+        tabla: pd.DataFrame,
+        columnas_base: list[str],
+        columnas_ref: list[str],
+        metodo: str,
+    ) -> pd.DataFrame:
+
+        if tabla.empty:
+            return base
+
+        # ----------------------------------------------------
+        # Solo referencias elegibles
+        # ----------------------------------------------------
+
+        lookup = (
+            tabla.loc[
+                tabla["elegible"],
+                columnas_ref
+                + [
+                    "dias_mediana",
+                    "observaciones",
+                ],
+            ]
+            .copy()
         )
-        for _, fila in resultado.iterrows()
-    ]
 
-    asignaciones_df = (
-        pd.DataFrame(
-            asignaciones,
-            index=resultado.index,
+        if lookup.empty:
+            return base
+
+        # ----------------------------------------------------
+        # La función anterior devolvía la primera coincidencia.
+        # Conservamos exactamente ese comportamiento.
+        # ----------------------------------------------------
+
+        lookup = lookup.drop_duplicates(
+            subset=columnas_ref,
+            keep="first",
         )
-    )
 
-    resultado = pd.concat(
-        [
-            resultado,
-            asignaciones_df,
+        # ----------------------------------------------------
+        # Renombrar claves si base y referencia tienen
+        # nombres distintos.
+        # ----------------------------------------------------
+
+        renombres = {
+            columna_ref: columna_base
+            for columna_base, columna_ref
+            in zip(
+                columnas_base,
+                columnas_ref,
+            )
+            if columna_base != columna_ref
+        }
+
+        lookup = lookup.rename(
+            columns=renombres
+        )
+
+        lookup = lookup.rename(
+            columns={
+                "dias_mediana":
+                    "_dias_ref",
+
+                "observaciones":
+                    "_observaciones_ref",
+            }
+        )
+
+        # ----------------------------------------------------
+        # Merge masivo
+        # ----------------------------------------------------
+
+        base = base.merge(
+            lookup,
+            on=columnas_base,
+            how="left",
+            sort=False,
+            validate="many_to_one",
+        )
+
+        # ----------------------------------------------------
+        # Solo asignar VIN todavía sin referencia
+        # ----------------------------------------------------
+
+        sin_referencia = (
+            base[
+                "dias_historicos_estimados"
+            ].isna()
+        )
+
+        referencia_encontrada = (
+            base[
+                "_dias_ref"
+            ].notna()
+        )
+
+        aplicar = (
+            sin_referencia
+            & referencia_encontrada
+        )
+
+        base.loc[
+            aplicar,
+            "dias_historicos_estimados",
+        ] = (
+            base.loc[
+                aplicar,
+                "_dias_ref",
+            ]
+        )
+
+        base.loc[
+            aplicar,
+            "n_referencias_historicas",
+        ] = (
+            base.loc[
+                aplicar,
+                "_observaciones_ref",
+            ]
+        )
+
+        base.loc[
+            aplicar,
+            "metodo_historico",
+        ] = metodo
+
+        # ----------------------------------------------------
+        # Limpiar columnas auxiliares
+        # ----------------------------------------------------
+
+        base = base.drop(
+            columns=[
+                "_dias_ref",
+                "_observaciones_ref",
+            ]
+        )
+
+        return base
+
+    # ========================================================
+    # 1. VIN PROPIO
+    # ========================================================
+
+    resultado = aplicar_referencia(
+        base=resultado,
+
+        tabla=referencias[
+            "referencia_vin"
         ],
-        axis=1,
+
+        columnas_base=[
+            "vin",
+        ],
+
+        columnas_ref=[
+            "vin",
+        ],
+
+        metodo="VIN_PROPIO",
     )
+
+    # ========================================================
+    # 2. PARQUE + MODELO + TRANSICIÓN + SEDE
+    # ========================================================
+
+    resultado = aplicar_referencia(
+        base=resultado,
+
+        tabla=referencias[
+            "referencia_parque_modelo_transicion_sede"
+        ],
+
+        columnas_base=[
+            "parque",
+            "modelo",
+            "km_origen_proyeccion",
+            "km_destino_proyeccion",
+            "sede",
+        ],
+
+        columnas_ref=[
+            "parque",
+            "modelo",
+            "km_origen",
+            "km_destino",
+            "sede_referencia",
+        ],
+
+        metodo="PARQUE_MODELO_TRANSICION_SEDE",
+    )
+
+    # ========================================================
+    # 3. PARQUE + MODELO + TRANSICIÓN
+    # ========================================================
+
+    resultado = aplicar_referencia(
+        base=resultado,
+
+        tabla=referencias[
+            "referencia_parque_modelo_transicion"
+        ],
+
+        columnas_base=[
+            "parque",
+            "modelo",
+            "km_origen_proyeccion",
+            "km_destino_proyeccion",
+        ],
+
+        columnas_ref=[
+            "parque",
+            "modelo",
+            "km_origen",
+            "km_destino",
+        ],
+
+        metodo="PARQUE_MODELO_TRANSICION",
+    )
+
+    # ========================================================
+    # 4. PARQUE + TRANSICIÓN
+    # ========================================================
+
+    resultado = aplicar_referencia(
+        base=resultado,
+
+        tabla=referencias[
+            "referencia_parque_transicion"
+        ],
+
+        columnas_base=[
+            "parque",
+            "km_origen_proyeccion",
+            "km_destino_proyeccion",
+        ],
+
+        columnas_ref=[
+            "parque",
+            "km_origen",
+            "km_destino",
+        ],
+
+        metodo="PARQUE_TRANSICION",
+    )
+
+    # ========================================================
+    # 5. TRANSICIÓN GENERAL
+    # ========================================================
+
+    resultado = aplicar_referencia(
+        base=resultado,
+
+        tabla=referencias[
+            "referencia_transicion_general"
+        ],
+
+        columnas_base=[
+            "km_origen_proyeccion",
+            "km_destino_proyeccion",
+        ],
+
+        columnas_ref=[
+            "km_origen",
+            "km_destino",
+        ],
+
+        metodo="TRANSICION_GENERAL",
+    )
+
+    # ========================================================
+    # TIPOS
+    # ========================================================
 
     resultado[
         "dias_historicos_estimados"
@@ -2545,9 +3155,7 @@ def proyectar_fecha_historica(
         resultado[
             "dias_historicos_estimados"
         ]
-        .astype(
-            "Int64"
-        )
+        .astype("Int64")
     )
 
     resultado[
@@ -2556,10 +3164,12 @@ def proyectar_fecha_historica(
         resultado[
             "n_referencias_historicas"
         ]
-        .astype(
-            "Int64"
-        )
+        .astype("Int64")
     )
+
+    # ========================================================
+    # FECHA HISTÓRICA PROYECTADA
+    # ========================================================
 
     resultado[
         "fecha_historica"
@@ -2576,8 +3186,22 @@ def proyectar_fecha_historica(
         )
     )
 
-    return resultado
+    # ========================================================
+    # RESTAURAR ÍNDICE
+    # ========================================================
 
+    resultado = (
+        resultado
+        .set_index(
+            "_indice_original"
+        )
+    )
+
+    resultado.index.name = (
+        estado_actual.index.name
+    )
+
+    return resultado
 
 # ============================================================
 # AUDITORÍA DE COBERTURA SOBRE VIN ACTUALES
