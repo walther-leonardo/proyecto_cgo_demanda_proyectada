@@ -1,0 +1,6 @@
+streamlit run app.py
+streamlit run app_retencion.py
+
+
+pip freeze > requirements.txt
+pip install -r requirements.txt

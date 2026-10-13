@@ -1375,6 +1375,236 @@ def construir_calidad_datos(
 
     return calidad
 
+# ============================================================
+# función adicional ante datos derales de clientes
+# ============================================================
+
+def consolidar_clientes_ultimo_registro(
+    clientes: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Construye un maestro temporal de clientes con una sola fila
+    por nro documento.
+
+    Regla de negocio temporal
+    -------------------------
+    1. Se respeta el orden original del archivo clientes.xlsx.
+       Las filas ubicadas más abajo se consideran más recientes.
+
+    2. Para cada nro documento:
+       - se utiliza el último registro que tenga teléfono válido;
+       - si ningún registro del documento tiene teléfono válido,
+         se utiliza el último registro disponible.
+
+    3. Se conserva la fila completa seleccionada, por lo que
+       nombre, teléfono y correo pertenecen al mismo registro.
+
+    Esta estrategia evita merges many-to-many y refleja el
+    mecanismo actual de actualización incremental de clientes.
+    """
+
+    if clientes.empty:
+        return clientes.copy()
+
+    columnas_requeridas = [
+        "nro documento",
+        "telefono",
+    ]
+
+    faltantes = [
+        columna
+        for columna in columnas_requeridas
+        if columna not in clientes.columns
+    ]
+
+    if faltantes:
+        raise ValueError(
+            "CLIENTES no contiene las columnas requeridas: "
+            f"{faltantes}"
+        )
+
+    df = clientes.copy()
+
+    # --------------------------------------------------------
+    # Conservar orden físico del archivo.
+    # Una fila mayor = registro más reciente.
+    # --------------------------------------------------------
+
+    df["_orden_fuente"] = range(
+        len(df)
+    )
+
+    # --------------------------------------------------------
+    # Normalizar documento
+    # --------------------------------------------------------
+
+    df["nro documento"] = (
+        df["nro documento"]
+        .astype("string")
+        .str.strip()
+    )
+
+    df["nro documento"] = (
+        df["nro documento"]
+        .replace(
+            {
+                "": pd.NA,
+                "nan": pd.NA,
+                "None": pd.NA,
+                "<NA>": pd.NA,
+            }
+        )
+    )
+
+    # No podemos construir identidad sin documento.
+    df = df.loc[
+        df["nro documento"].notna()
+    ].copy()
+
+    # --------------------------------------------------------
+    # Identificar teléfono válido.
+    #
+    # Por ahora la regla es deliberadamente conservadora:
+    # válido = no nulo / no vacío.
+    #
+    # No hacemos todavía limpieza avanzada de teléfonos porque
+    # eso corresponde al futuro proyecto de Calidad de Clientes.
+    # --------------------------------------------------------
+
+    telefono = (
+        df["telefono"]
+        .astype("string")
+        .str.strip()
+    )
+
+    df["_telefono_valido"] = (
+        telefono.notna()
+        &
+        ~telefono.isin(
+            [
+                "",
+                "nan",
+                "None",
+                "<NA>",
+            ]
+        )
+    )
+
+    # --------------------------------------------------------
+    # A. Último registro CON teléfono por documento
+    # --------------------------------------------------------
+
+    ultimo_con_telefono = (
+        df.loc[
+            df["_telefono_valido"]
+        ]
+        .sort_values(
+            "_orden_fuente",
+            kind="stable",
+        )
+        .drop_duplicates(
+            subset=[
+                "nro documento",
+            ],
+            keep="last",
+        )
+    )
+
+    # --------------------------------------------------------
+    # B. Último registro disponible por documento
+    #
+    # Sirve como fallback cuando nunca encontramos teléfono.
+    # --------------------------------------------------------
+
+    ultimo_registro = (
+        df
+        .sort_values(
+            "_orden_fuente",
+            kind="stable",
+        )
+        .drop_duplicates(
+            subset=[
+                "nro documento",
+            ],
+            keep="last",
+        )
+    )
+
+    # --------------------------------------------------------
+    # Documentos que ya tienen una fila con teléfono
+    # --------------------------------------------------------
+
+    documentos_con_telefono = set(
+        ultimo_con_telefono[
+            "nro documento"
+        ]
+    )
+
+    # --------------------------------------------------------
+    # Solo fallback para documentos sin teléfono histórico
+    # --------------------------------------------------------
+
+    fallback_sin_telefono = (
+        ultimo_registro.loc[
+            ~ultimo_registro[
+                "nro documento"
+            ].isin(
+                documentos_con_telefono
+            )
+        ]
+    )
+
+    # --------------------------------------------------------
+    # Maestro final
+    # --------------------------------------------------------
+
+    maestro = pd.concat(
+        [
+            ultimo_con_telefono,
+            fallback_sin_telefono,
+        ],
+        ignore_index=True,
+    )
+
+    # Recuperamos orden documental estable.
+    maestro = (
+        maestro
+        .sort_values(
+            "_orden_fuente",
+            kind="stable",
+        )
+        .drop(
+            columns=[
+                "_orden_fuente",
+                "_telefono_valido",
+            ]
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    # --------------------------------------------------------
+    # Control contractual crítico
+    # --------------------------------------------------------
+
+    duplicados = int(
+        maestro[
+            "nro documento"
+        ]
+        .duplicated()
+        .sum()
+    )
+
+    if duplicados != 0:
+        raise ValueError(
+            "El maestro consolidado de clientes todavía "
+            f"contiene {duplicados} documentos duplicados."
+        )
+
+    return maestro
+
+
 
 # ============================================================
 # PIPELINE DE PREPARACIÓN
@@ -1417,6 +1647,10 @@ def preparar_datos(
         clientes_raw
     )
 
+    clientes = consolidar_clientes_ultimo_registro(
+        clientes
+    )
+
     taller = clasificar_parque(
         taller=taller,
         retail=retail,
@@ -1453,6 +1687,55 @@ def preparar_datos(
         )
     )
 
+    auditoria_clientes = pd.DataFrame(
+        [
+            {
+                "metrica":
+                    "filas_clientes_originales",
+                "valor":
+                    len(clientes_raw),
+            },
+            {
+                "metrica":
+                    "clientes_maestro",
+                "valor":
+                    len(clientes),
+            },
+            {
+                "metrica":
+                    "documentos_unicos_maestro",
+                "valor":
+                    clientes[
+                        "nro documento"
+                    ].nunique(),
+            },
+            {
+                "metrica":
+                    "documentos_duplicados_maestro",
+                "valor":
+                    int(
+                        clientes[
+                            "nro documento"
+                        ]
+                        .duplicated()
+                        .sum()
+                    ),
+            },
+            {
+                "metrica":
+                    "clientes_con_telefono",
+                "valor":
+                    int(
+                        clientes[
+                            "telefono"
+                        ]
+                        .notna()
+                        .sum()
+                    ),
+            },
+        ]
+    )
+
     return {
         "retail":
             retail,
@@ -1462,6 +1745,9 @@ def preparar_datos(
 
         "clientes":
             clientes,
+
+        "auditoria_clientes":
+            auditoria_clientes,
 
         "historia_preventiva":
             historia_preventiva,
