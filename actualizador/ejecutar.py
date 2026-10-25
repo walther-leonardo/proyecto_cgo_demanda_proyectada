@@ -1,11 +1,15 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
+
 import argparse
 from datetime import datetime
 from io import BytesIO
 from zoneinfo import ZoneInfo
-
+from itertools import zip_longest
 import pandas as pd
 from openpyxl import load_workbook
 
@@ -235,7 +239,6 @@ def verificar_archivo(
         )
 
 
-
 def respaldar(sp, drive_id, originales, archivos):
     """
     Crea o sobrescribe un backup rotativo por cada archivo
@@ -273,59 +276,160 @@ def respaldar(sp, drive_id, originales, archivos):
         print(f"   ✅ Backup verificado: {nombre_backup}")
 
 
+def _celdas_con_contenido(hoja):
+    """
+    Recorre las celdas con valores o fórmulas.
 
+    Ignora las celdas vacías y las filas que únicamente
+    contienen formato.
+    """
+    for fila in hoja.iter_rows():
+        for celda in fila:
+            valor = celda.value
+
+            if valor is None or valor == "":
+                continue
+
+            yield (
+                celda.coordinate,
+                valor,
+            )
+
+
+def verificar_publicacion_excel(
+    original: bytes,
+    descargado: bytes,
+    nombre_archivo: str,
+) -> None:
+    """
+    Comprueba que un Excel publicado conserva el
+    contenido del Excel preparado.
+
+    Primero compara bytes. Si difieren, compara los
+    nombres de las hojas, las celdas y sus valores.
+
+    Las fórmulas se comparan como fórmulas, no por
+    sus resultados calculados.
+    """
+    if original == descargado:
+        print(
+            f"   ✅ Verificación binaria: {nombre_archivo}"
+        )
+        return
+
+    print(
+        f"   ℹ️ Diferencia binaria en {nombre_archivo}. "
+        "Verificando contenido del Excel..."
+    )
+
+    libro_original = load_workbook(
+        BytesIO(original),
+        read_only=True,
+        data_only=False,
+    )
+
+    libro_descargado = None
+
+    try:
+        libro_descargado = load_workbook(
+            BytesIO(descargado),
+            read_only=True,
+            data_only=False,
+        )
+
+        if libro_original.sheetnames != libro_descargado.sheetnames:
+            raise RuntimeError(
+                f"{nombre_archivo}: las hojas no coinciden. "
+                f"Original: {libro_original.sheetnames}. "
+                f"Publicado: {libro_descargado.sheetnames}."
+            )
+
+        for nombre_hoja in libro_original.sheetnames:
+            hoja_original = libro_original[nombre_hoja]
+            hoja_descargada = libro_descargado[nombre_hoja]
+
+            celdas_originales = _celdas_con_contenido(
+                hoja_original
+            )
+
+            celdas_descargadas = _celdas_con_contenido(
+                hoja_descargada
+            )
+
+            for celda_original, celda_descargada in zip_longest(
+                celdas_originales,
+                celdas_descargadas,
+            ):
+                if celda_original != celda_descargada:
+                    raise RuntimeError(
+                        f"{nombre_archivo}: diferencia en "
+                        f"la hoja '{nombre_hoja}'. "
+                        f"Original: {celda_original!r}. "
+                        f"Publicado: {celda_descargada!r}."
+                    )
+
+        print(
+            f"   ✅ Contenido verificado: {nombre_archivo}"
+        )
+
+    finally:
+        libro_original.close()
+
+        if libro_descargado is not None:
+            libro_descargado.close()
 
 
 def publicar(sp, drive_id, preparados, originales):
     """
-    Publica y verifica cada archivo.
+    Publica los Excel preparados y verifica su contenido.
 
-    Si ocurre un error, intenta restaurar todos los
-    archivos involucrados, incluido aquel cuya carga falló.
+    Si ocurre un fallo, restaura únicamente los archivos
+    cuya publicación fue iniciada.
 
-    La restauración también se verifica mediante descarga.
+    La restauración se verifica byte por byte contra
+    el archivo original.
     """
-    archivos = list(preparados)
+    archivos_iniciados = []
     archivo_en_proceso = None
 
     try:
-        for nombre in archivos:
+        for nombre, contenido in preparados.items():
             archivo_en_proceso = nombre
+
+            ruta = f"{INPUT_FOLDER}/{nombre}"
 
             print(f"📤 Publicando {nombre}...")
 
-            ruta = f"{INPUT_FOLDER}/{nombre}"
+            # Se registra antes de subir porque una operación
+            # fallida podría haber modificado el destino.
+            archivos_iniciados.append(nombre)
 
             sp.upload_file_by_path(
                 drive_id=drive_id,
                 file_path=ruta,
-                file_content=BytesIO(preparados[nombre]),
+                file_content=BytesIO(contenido),
             )
 
-            verificacion = sp.download_file_by_path(
+            descargado = sp.download_file_by_path(
                 drive_id=drive_id,
                 file_path=ruta,
             ).getvalue()
 
-            if verificacion != preparados[nombre]:
-                raise RuntimeError(
-                    f"Verificación fallida: {nombre}"
-                )
-
-            print(f"   ✅ Publicación verificada: {nombre}")
+            verificar_publicacion_excel(
+                original=contenido,
+                descargado=descargado,
+                nombre_archivo=nombre,
+            )
 
     except Exception as error:
         print("\n⚠️ Error durante la publicación.")
         print(f"Archivo en proceso: {archivo_en_proceso}")
         print(f"Detalle: {error}")
-        print("🔄 Intentando restaurar los originales...")
+        print("🔄 Restaurando archivos afectados...")
 
         errores_restauracion = []
 
-        # Se restauran todos los archivos preparados.
-        # No asumimos que una carga fallida dejó
-        # el archivo de destino intacto.
-        for nombre in reversed(archivos):
+        for nombre in reversed(archivos_iniciados):
             ruta = f"{INPUT_FOLDER}/{nombre}"
 
             try:
@@ -342,8 +446,8 @@ def publicar(sp, drive_id, preparados, originales):
 
                 if restaurado != originales[nombre]:
                     raise RuntimeError(
-                        "El contenido restaurado no coincide "
-                        "con el original."
+                        "La restauración no coincide "
+                        "con el archivo original."
                     )
 
                 print(f"   ✅ Restaurado: {nombre}")
@@ -352,27 +456,88 @@ def publicar(sp, drive_id, preparados, originales):
                 errores_restauracion.append(
                     f"{nombre}: {exc}"
                 )
+
                 print(
-                    f"   ❌ No se confirmó restauración: "
-                    f"{nombre}"
+                    f"   ❌ Restauración no confirmada: {nombre}"
                 )
 
         if errores_restauracion:
             raise RuntimeError(
-                "PUBLICACIÓN FALLIDA Y RESTAURACIÓN INCOMPLETA. "
-                "Revisar los archivos originales y los backups "
-                "en SharePoint antes de continuar. Detalles: "
+                "PUBLICACIÓN FALLIDA. "
+                "La restauración quedó incompleta: "
                 + "; ".join(errores_restauracion)
             ) from error
 
         raise RuntimeError(
-            "Publicación fallida. Todos los archivos "
+            "Publicación fallida. Los archivos afectados "
             "fueron restaurados y verificados."
         ) from error
 
+    print("\n✅ Todos los archivos publicados y verificados.")
 
 
+def ejecutar_reportes() -> None:
+    """
+    Ejecuta demanda proyectada y auditoría vehicular.
 
+    Cada proceso es independiente: un error de auditoría
+    no invalida una actualización de fuentes ya publicada.
+    """
+    print("\n" + "=" * 65)
+    print("🐔 CGO — GENERACIÓN DE REPORTES")
+    print("=" * 65)
+
+    errores = []
+
+    # 1. Demanda proyectada.
+    print("\n🚀 Ejecutando motor de demanda...")
+
+    try:
+        from main import ejecutar_motor
+
+        resultado = ejecutar_motor(
+            log_callback=print,
+            generar_reporte=True,
+        )
+
+        print(
+            "✅ Demanda publicada: "
+            f"{resultado['nombre_reporte']}"
+        )
+
+    except Exception as error:
+        errores.append(f"Demanda: {error}")
+        print(f"❌ Error en demanda: {error}")
+
+    # 2. Auditoría vehicular.
+    print("\n🔍 Ejecutando auditoría de vehículos...")
+
+    ruta_auditoria = (
+        Path(__file__).resolve().parents[1]
+        / "tests"
+        / "auditoria_vehiculos.py"
+    )
+
+    try:
+        subprocess.run(
+            [sys.executable, str(ruta_auditoria)],
+            check=True,
+        )
+
+        print("✅ Auditoría vehicular completada.")
+
+    except (subprocess.CalledProcessError, OSError) as error:
+        errores.append(f"Auditoría vehicular: {error}")
+        print(f"❌ Error en auditoría: {error}")
+
+    if errores:
+        raise RuntimeError(
+            "Las fuentes publicadas no se han revertido. "
+            "Hubo errores al generar los reportes:\n"
+            + "\n".join(errores)
+        )
+
+    print("\n🐔 Proceso integral completado correctamente.")
 
 
 def ejecutar(publicacion: bool = False):
@@ -524,6 +689,8 @@ def ejecutar(publicacion: bool = False):
 
     if not preparados:
         print("\n✅ No hay archivos que actualizar.")
+        print("🐔 Se generarán los reportes con las fuentes actuales.")
+        ejecutar_reportes()
         return
 
     respuesta = input(
@@ -564,11 +731,20 @@ def ejecutar(publicacion: bool = False):
         originales,
     )
 
+    print("\n✅ FUENTES PUBLICADAS CORRECTAMENTE")
+
+    ejecutar_reportes()
+
     fin = datetime.now(ZoneInfo("America/Lima"))
 
-    print("\n✅ FUENTES PUBLICADAS CORRECTAMENTE")
-    print(f"Duración: {(fin - inicio).total_seconds():.1f} s")
-    print("🐔 Ya puedes ejecutar el motor de demanda.")
+    print("\n" + "=" * 65)
+    print("🐔 ACTUALIZACIÓN INTEGRAL FINALIZADA")
+    print("=" * 65)
+
+    print(
+        f"Duración total: "
+        f"{(fin - inicio).total_seconds():.1f} segundos"
+    )
 
 
 def main():

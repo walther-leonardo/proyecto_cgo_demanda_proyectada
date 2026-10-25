@@ -29,7 +29,10 @@ from m365.excel import read_excel
 
 TABLA_SAP = "catalog_lhcl_prod_gp.gp_adv_ai.gema_maestro_vehiculos"
 ARCHIVO_MODELOS = "modelos vehiculos.xlsx"
-ARCHIVO_REPORTE = "auditoria_calidad_vehiculos.xlsx"
+ARCHIVO_REPORTE = (
+    "auditoria_calidad_vehiculos_"
+    f"{datetime.now(ZoneInfo('America/Lima')):%Y-%m-%d_%H-%M-%S}.xlsx"
+)
 
 COLUMNAS_TALLER = ["Id doc", "vin", "placa", "modelo", "año"]
 COLUMNAS_MODELOS = ["Material", "Modelo", "Año"]
