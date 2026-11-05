@@ -239,13 +239,16 @@ def verificar_archivo(
         )
 
 
+
 def respaldar(sp, drive_id, originales, archivos):
     """
-    Crea o sobrescribe un backup rotativo por cada archivo
-    que será modificado.
+    Crea o reemplaza los backups rotativos en SharePoint.
 
-    Verifica que el contenido respaldado sea idéntico
-    al original antes de autorizar la publicación.
+    Verifica primero la igualdad binaria y, cuando difiere,
+    comprueba la equivalencia de valores y fórmulas.
+
+    Si algún respaldo no supera la verificación,
+    la publicación de las fuentes no comienza.
     """
     for nombre in archivos:
         nombre_backup = (
@@ -267,13 +270,14 @@ def respaldar(sp, drive_id, originales, archivos):
             file_path=ruta,
         ).getvalue()
 
-        if copia != originales[nombre]:
-            raise RuntimeError(
-                f"Backup de {nombre} no coincide "
-                "con el archivo original."
-            )
+        verificar_publicacion_excel(
+            original=originales[nombre],
+            descargado=copia,
+            nombre_archivo=nombre_backup,
+        )
 
         print(f"   ✅ Backup verificado: {nombre_backup}")
+
 
 
 def _celdas_con_contenido(hoja):
@@ -444,11 +448,11 @@ def publicar(sp, drive_id, preparados, originales):
                     file_path=ruta,
                 ).getvalue()
 
-                if restaurado != originales[nombre]:
-                    raise RuntimeError(
-                        "La restauración no coincide "
-                        "con el archivo original."
-                    )
+                verificar_publicacion_excel(
+                    original=originales[nombre],
+                    descargado=restaurado,
+                    nombre_archivo=nombre,
+                )
 
                 print(f"   ✅ Restaurado: {nombre}")
 

@@ -4215,13 +4215,13 @@ def _clasificar_estado_temporal(
     ).days
 
     # --------------------------------------------------------
-    # Vencidos
+    # Vencidos — política comercial noviembre 2026
     # --------------------------------------------------------
 
-    if dias_hasta <= -180:
+    if dias_hasta <= -366:
         return "VENCIDO_LEJANO"
 
-    if -179 <= dias_hasta <= -31:
+    if -365 <= dias_hasta <= -31:
         return "VENCIDO_CERCANO"
 
     if -30 <= dias_hasta <= -8:
@@ -5219,7 +5219,7 @@ def agregar_kilometraje_esperado_actual(
 
         es_vencido_lejano = (
             dias_atraso_original
-            >= 180
+            >= 366
         )
 
         # ----------------------------------------------------
